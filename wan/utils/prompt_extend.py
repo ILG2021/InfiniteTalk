@@ -242,7 +242,7 @@ class DashScopePromptExpander(PromptExpander):
                 'DASH_API_URL'] is not None:
             dashscope.base_http_api_url = os.environ['DASH_API_URL']
         else:
-            dashscope.base_http_api_url = 'https://dashscope.aliyuncs.com/api/v1'
+            raise ValueError("DASH_API_URL is not set (default mainland Chinese endpoint has been removed)")
         self.api_key = api_key
 
         self.max_image_size = max_image_size
@@ -530,7 +530,7 @@ if __name__ == "__main__":
     en_prompt = "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
     # test cases for prompt extend
     ds_model_name = "qwen-plus"
-    # for qwenmodel, you can download the model form modelscope or huggingface and use the model path as model_name
+    # for qwenmodel, you can download the model from huggingface and use the model path as model_name
     qwen_model_name = "./models/Qwen2.5-14B-Instruct/"  # VRAM: 29136MiB
     # qwen_model_name = "./models/Qwen2.5-14B-Instruct-AWQ/"  # VRAM: 10414MiB
 

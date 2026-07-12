@@ -717,9 +717,10 @@ class InfiniteTalkPipeline:
                     torch_gc()
 
                     if math.isclose(text_guide_scale, 1.0):
-                        noise_pred_drop_audio = self.model(
-                            latent_model_input, t=timestep, **arg_null_audio)[0]  
-                        torch_gc()
+                        if not math.isclose(audio_guide_scale, 1.0):
+                            noise_pred_drop_audio = self.model(
+                                latent_model_input, t=timestep, **arg_null_audio)[0]  
+                            torch_gc()
                     else:
                         noise_pred_drop_text = self.model(
                             latent_model_input, t=timestep, **arg_null_text)[0] 
@@ -750,7 +751,10 @@ class InfiniteTalkPipeline:
                     else:
                         # vanilla CFG strategy
                         if math.isclose(text_guide_scale, 1.0):
-                            noise_pred = noise_pred_drop_audio + audio_guide_scale* (noise_pred_cond - noise_pred_drop_audio)  
+                            if math.isclose(audio_guide_scale, 1.0):
+                                noise_pred = noise_pred_cond
+                            else:
+                                noise_pred = noise_pred_drop_audio + audio_guide_scale* (noise_pred_cond - noise_pred_drop_audio)  
                         else:
                             noise_pred = noise_pred_uncond + text_guide_scale * (
                                 noise_pred_cond - noise_pred_drop_text) + \
