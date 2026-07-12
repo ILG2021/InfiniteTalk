@@ -171,13 +171,17 @@ sudo yum install ffmpeg ffmpeg-devel
 | Wan2.1-I2V-14B-480P  |      🤗 [Huggingface](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P)       | Base model
 | chinese-wav2vec2-base |      🤗 [Huggingface](https://huggingface.co/TencentGameMate/chinese-wav2vec2-base)          | Audio encoder
 | MeiGen-InfiniteTalk      |      🤗 [Huggingface](https://huggingface.co/MeiGen-AI/InfiniteTalk)              | Our audio condition weights
+| lightx2v LoRA (4-step) | 🤗 [Huggingface](https://huggingface.co/Kijai/WanVideo_comfy/blob/main/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors) | Optional: 4-step fast inference LoRA
 
 Download models using huggingface-cli:
 ``` sh
-huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P --local-dir ./weights/Wan2.1-I2V-14B-480P
-huggingface-cli download TencentGameMate/chinese-wav2vec2-base --local-dir ./weights/chinese-wav2vec2-base
-huggingface-cli download TencentGameMate/chinese-wav2vec2-base model.safetensors --revision refs/pr/1 --local-dir ./weights/chinese-wav2vec2-base
-huggingface-cli download MeiGen-AI/InfiniteTalk --local-dir ./weights/InfiniteTalk
+hf download Wan-AI/Wan2.1-I2V-14B-480P --local-dir ./weights/Wan2.1-I2V-14B-480P
+hf download TencentGameMate/chinese-wav2vec2-base --local-dir ./weights/chinese-wav2vec2-base
+hf download TencentGameMate/chinese-wav2vec2-base model.safetensors --revision refs/pr/1 --local-dir ./weights/chinese-wav2vec2-base
+hf download MeiGen-AI/InfiniteTalk --local-dir ./weights/InfiniteTalk
+
+# Optional: lightx2v LoRA for 4-step fast inference
+hf download Kijai/WanVideo_comfy Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors --local-dir ./weights
 
 ```
 
@@ -301,22 +305,21 @@ python generate_infinitetalk.py \
 
 [FusioniX](https://huggingface.co/vrgamedevgirl84/Wan14BT2VFusioniX/blob/main/FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors) require 8 steps and [lightx2v](https://huggingface.co/Kijai/WanVideo_comfy/blob/main/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors) requires only 4 steps.
 
-```
-python generate_infinitetalk.py \
-    --ckpt_dir weights/Wan2.1-I2V-14B-480P \
-    --wav2vec_dir 'weights/chinese-wav2vec2-base' \
-    --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors \
-    --lora_dir weights/Wan2.1_I2V_14B_FusionX_LoRA.safetensors \
-    --input_json examples/single_example_image.json \
-    --lora_scale 1.0 \
-    --size infinitetalk-480 \
-    --sample_text_guide_scale 1.0 \
-    --sample_audio_guide_scale 2.0 \
-    --sample_steps 8 \
-    --mode streaming \
-    --motion_frame 9 \
-    --sample_shift 2 \
-    --num_persistent_param_in_dit 0 \
+python generate_infinitetalk.py `
+    --ckpt_dir weights/Wan2.1-I2V-14B-480P `
+    --wav2vec_dir "weights/chinese-wav2vec2-base" `
+    --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors `
+    --lora_dir weights/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors `
+    --input_json examples/single_example_image.json `
+    --lora_scale 1.0 `
+    --size infinitetalk-720 `
+    --sample_text_guide_scale 1.0 `
+    --sample_audio_guide_scale 1.0 `
+    --sample_steps 4 `
+    --mode streaming `
+    --motion_frame 9 `
+    --sample_shift 2 `
+    --num_persistent_param_in_dit 10000000000 `
     --save_file infinitetalk_res_lora
 ```
 
