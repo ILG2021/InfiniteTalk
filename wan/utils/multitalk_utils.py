@@ -38,14 +38,6 @@ ASPECT_RATIO_960 = {
      '2.30': ([1472, 640], 1), '2.67': ([1536, 576], 1), '2.89': ([1664, 576], 1), '3.62': ([1856, 512], 1), 
      '3.75': ([1920, 512], 1)}
 
-
-
-def torch_gc():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
-
-
-
 def split_token_counts_and_frame_ids(T, token_frame, world_size, rank):
 
     S = T * token_frame
@@ -97,7 +89,6 @@ def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', att
     x_ref_attn_map_source = x_ref_attn_map_source.to(visual_q.dtype)
 
     for class_idx, ref_target_mask in enumerate(ref_target_masks):
-        torch_gc()
         ref_target_mask = ref_target_mask[None, None, None, ...]
         x_ref_attnmap = x_ref_attn_map_source * ref_target_mask
         x_ref_attnmap = x_ref_attnmap.sum(-1) / ref_target_mask.sum() # B, H, x_seqlens, ref_seqlens --> B, H, x_seqlens
@@ -112,7 +103,6 @@ def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', att
     
     del attn
     del x_ref_attn_map_source
-    torch_gc()
 
     return torch.concat(x_ref_attn_maps, dim=0)
 

@@ -26,11 +26,13 @@ import accelerate
 
 from .distributed.fsdp import shard_model
 from .modules.clip import CLIPModel
-from .modules.multitalk_model import WanModel, WanLayerNorm, WanRMSNorm
+from .modules.multitalk_model import (WanModel, WanLayerNorm, WanRMSNorm,
+                                      set_attention_backend)
 from .modules.t5 import T5EncoderModel, T5LayerNorm, T5RelativeEmbedding
 from .modules.vae import WanVAE, CausalConv3d, RMS_norm, Upsample
 from .utils.multitalk_utils import MomentumBuffer, adaptive_projected_guidance, match_and_blend_colors
 from src.vram_management import AutoWrappedQLinear, AutoWrappedLinear, AutoWrappedModule, enable_vram_management
+from src.vram_management.block_swap import BlockSwapManager
 from wan.utils.utils import convert_video_to_h264, extract_specific_frames, get_video_codec
 from wan.wan_lora import WanLoraWrapper
 
@@ -40,7 +42,6 @@ import optimum.quanto.nn.qlinear as qlinear
 
 def torch_gc():
     torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
 
 def to_param_dtype_fp32only(model, param_dtype):
     for module in model.modules():
@@ -126,6 +127,7 @@ class InfiniteTalkPipeline:
         quant = None,
         dit_path = None,
         infinitetalk_dir=None,
+        attention_backend='flash',
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -154,6 +156,9 @@ class InfiniteTalkPipeline:
         """
         if quant is not None and quant not in ("int8", "fp8"):
             raise ValueError("quant must be 'int8', 'fp8', or None(default fp32 model)")
+        set_attention_backend(attention_backend)
+        if not torch.backends.cudnn.deterministic:
+            torch.backends.cudnn.benchmark = True
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
         self.rank = rank
@@ -282,6 +287,7 @@ class InfiniteTalkPipeline:
         self.cpu_offload = False
         self.model_names = ["model"]
         self.vram_management = False
+        self.block_swap_enabled = False
 
     def add_noise(
         self,
@@ -327,11 +333,47 @@ class InfiniteTalkPipeline:
                 computation_device=self.device,
             ),
         )
+        # RoPE frequencies are small and read by every attention block. Keeping
+        # this non-persistent buffer on CUDA avoids repeated CPU-to-GPU copies.
+        self.model.freqs = self.model.freqs.to(self.device)
         self.enable_cpu_offload()
 
     def enable_cpu_offload(self):
         self.cpu_offload = True
-    
+
+    def enable_block_swap(
+        self,
+        blocks_to_swap,
+        prefetch_blocks=1,
+        use_non_blocking=False,
+    ):
+        if self.vram_management:
+            raise ValueError(
+                "Block swap cannot be combined with module-level VRAM management")
+        if dist.is_initialized() or self.use_usp:
+            raise ValueError(
+                "Block swap currently supports single-GPU inference only")
+        if not 0 <= int(blocks_to_swap) <= len(self.model.blocks):
+            raise ValueError(
+                f"blocks_to_swap must be in [0, {len(self.model.blocks)}]")
+
+        # Keep embeddings, adapters, head and the non-swapped block prefix on
+        # CUDA. The swap manager handles only complete transformer blocks.
+        for name, module in self.model.named_children():
+            if name != 'blocks':
+                module.to(self.device)
+        self.model.freqs = self.model.freqs.to(self.device)
+        manager = BlockSwapManager(
+            self.model.blocks,
+            self.device,
+            blocks_to_swap=blocks_to_swap,
+            prefetch_blocks=prefetch_blocks,
+            use_non_blocking=use_non_blocking,
+        )
+        self.model.set_block_swap_manager(manager)
+        self.block_swap_enabled = True
+        self.cpu_offload = False
+
     def load_models_to_device(self, loadmodel_names=[]):
         # only load models to device if cpu_offload is enabled
         if not self.cpu_offload:
@@ -495,7 +537,8 @@ class InfiniteTalkPipeline:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-        torch_gc()
+        if offload_model:
+            torch_gc()
         # prepare params for video generation
         indices = (torch.arange(2 * 2 + 1) - 2) * 1 
         clip_length = frame_num
@@ -505,7 +548,6 @@ class InfiniteTalkPipeline:
         audio_start_idx = 0
         audio_end_idx = audio_start_idx + clip_length
         gen_video_list = []
-        torch_gc()
 
         # set random seed and init noise
         seed = seed if seed >= 0 else random.randint(0, 99999999)
@@ -513,8 +555,6 @@ class InfiniteTalkPipeline:
         torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
         random.seed(seed)
-        torch.backends.cudnn.deterministic = True
-
         # start video generation iteratively
         while True:
             audio_embs = []
@@ -531,7 +571,6 @@ class InfiniteTalkPipeline:
                 audio_emb = full_audio_embs[human_idx][center_indices][None,...].to(self.device)
                 audio_embs.append(audio_emb)
             audio_embs = torch.concat(audio_embs, dim=0).to(self.param_dtype)
-            torch_gc()
 
             h, w = cond_image.shape[-2], cond_image.shape[-1]
             lat_h, lat_w = h // self.vae_stride[1], w // self.vae_stride[2]
@@ -558,13 +597,13 @@ class InfiniteTalkPipeline:
             msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
             msk = msk.transpose(1, 2).to(self.param_dtype) # B 4 T H W
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 # get clip embedding
                 self.clip.model.to(self.device)
                 clip_context = self.clip.visual(cond_image[:, :, -1:, :, :]).to(self.param_dtype) 
                 if offload_model:
                     self.clip.model.cpu()
-                torch_gc()
+                    torch_gc()
 
                 # zero padding and vae encode
                 video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
@@ -579,7 +618,6 @@ class InfiniteTalkPipeline:
                     latent_motion_frames = self.vae.encode(cond_frame)[0]
 
                 y = torch.concat([msk, y], dim=1) # B 4+C T H W
-                torch_gc()
             
 
             # construct human mask
@@ -624,8 +662,6 @@ class InfiniteTalkPipeline:
             ref_target_masks = (ref_target_masks > 0) 
             ref_target_masks = ref_target_masks.float().to(self.device)
 
-            torch_gc()
-
             @contextmanager
             def noop_no_sync():
                 yield
@@ -633,7 +669,7 @@ class InfiniteTalkPipeline:
             no_sync = getattr(self.model, 'no_sync', noop_no_sync)
 
             # evaluation mode
-            with torch.no_grad(), no_sync():
+            with torch.inference_mode(), no_sync():
                 
                 # prepare timesteps
                 timesteps = list(np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32))
@@ -646,49 +682,63 @@ class InfiniteTalkPipeline:
                 latent = noise
 
                 # prepare condition and uncondition configs
-                arg_c = {
-                    'context': [context],
-                    'clip_fea': clip_context,
-                    'seq_len': max_seq_len,
-                    'y': y,
-                    'audio': audio_embs,
-                    'ref_target_masks': ref_target_masks
-                }
-
-
-                arg_null_text = {
-                    'context': [context_null],
-                    'clip_fea': clip_context,
-                    'seq_len': max_seq_len,
-                    'y': y,
-                    'audio': audio_embs,
-                    'ref_target_masks': ref_target_masks
-                }
-
-                arg_null_audio = {
-                    'context': [context],
-                    'clip_fea': clip_context,
-                    'seq_len': max_seq_len,
-                    'y': y,
-                    'audio': torch.zeros_like(audio_embs)[-1:],
-                    'ref_target_masks': ref_target_masks
-                }
-
-
-                arg_null = {
-                    'context': [context_null],
-                    'clip_fea': clip_context,
-                    'seq_len': max_seq_len,
-                    'y': y,
-                    'audio': torch.zeros_like(audio_embs)[-1:],
-                    'ref_target_masks': ref_target_masks
-                }
-
-                torch_gc()
-                if not self.vram_management:
+                if self.block_swap_enabled:
+                    # BlockSwapManager owns transformer-block placement. Do
+                    # not call model.to(cuda), which would undo the swap set.
+                    pass
+                elif not self.vram_management:
                     self.model.to(self.device)
                 else:
                     self.load_models_to_device(["model"])
+
+                # Project static CFG conditioning once. The original code repeated
+                # these projections for every DiT call although none depend on t/x.
+                grid_size = (
+                    latent.shape[-2] // self.patch_size[1],
+                    latent.shape[-1] // self.patch_size[2],
+                )
+                null_audio = torch.zeros_like(audio_embs)[-1:]
+
+                def prepare_cfg(context_value, audio_value, shared_cache=None):
+                    # FSDP must enter through its wrapped forward method; keep the
+                    # original path for distributed inference.
+                    if dist.is_initialized():
+                        return {
+                            'context': [context_value],
+                            'clip_fea': clip_context,
+                            'seq_len': max_seq_len,
+                            'y': y,
+                            'audio': audio_value,
+                            'ref_target_masks': ref_target_masks,
+                        }
+                    cache = self.model.prepare_condition(
+                        context=[context_value],
+                        clip_fea=clip_context,
+                        audio=audio_value,
+                        ref_target_masks=ref_target_masks,
+                        grid_size=grid_size,
+                        dtype=self.param_dtype,
+                        device=self.device,
+                        shared_cache=shared_cache,
+                    )
+                    return {
+                        'seq_len': max_seq_len,
+                        'y': y,
+                        'condition_cache': cache,
+                    }
+
+                arg_c = prepare_cfg(context, audio_embs)
+                arg_null_text = None
+                arg_null_audio = None
+                arg_null = None
+                if math.isclose(text_guide_scale, 1.0):
+                    if not math.isclose(audio_guide_scale, 1.0):
+                        shared_cache = arg_c.get('condition_cache')
+                        arg_null_audio = prepare_cfg(
+                            context, null_audio, shared_cache=shared_cache)
+                else:
+                    arg_null_text = prepare_cfg(context_null, audio_embs)
+                    arg_null = prepare_cfg(context_null, null_audio)
                 
                 # injecting motion frames
                 if not is_first_clip:
@@ -714,20 +764,16 @@ class InfiniteTalkPipeline:
                     # inference with CFG strategy
                     noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0] 
-                    torch_gc()
 
                     if math.isclose(text_guide_scale, 1.0):
                         if not math.isclose(audio_guide_scale, 1.0):
                             noise_pred_drop_audio = self.model(
                                 latent_model_input, t=timestep, **arg_null_audio)[0]  
-                            torch_gc()
                     else:
                         noise_pred_drop_text = self.model(
                             latent_model_input, t=timestep, **arg_null_text)[0] 
-                        torch_gc()
                         noise_pred_uncond = self.model(
                             latent_model_input, t=timestep, **arg_null)[0]  
-                        torch_gc()
 
                     if extra_args.use_apg:
                         # correct update direction
@@ -778,10 +824,12 @@ class InfiniteTalkPipeline:
                     x0 = [latent.to(self.device)] 
                     del latent_model_input, timestep
                 
-                if offload_model: 
-                    if not self.vram_management:
+                if offload_model:
+                    # In block-swap mode the manager owns DiT placement and
+                    # must keep the resident prefix on CUDA between chunks.
+                    if not self.vram_management and not self.block_swap_enabled:
                         self.model.cpu()
-                torch_gc()
+                    torch_gc()
 
                 videos = self.vae.decode(x0)
             
@@ -834,9 +882,6 @@ class InfiniteTalkPipeline:
             
             if max_frames_num <= frame_num: break
             
-            torch_gc()
-            if offload_model:    
-                torch.cuda.synchronize()
             if dist.is_initialized():
                 dist.barrier()
         
@@ -851,7 +896,6 @@ class InfiniteTalkPipeline:
             dist.barrier()
 
         del noise, latent
-        torch_gc()
 
         return gen_video_samples[0] if self.rank == 0 else None
     

@@ -16,10 +16,23 @@ from ..utils.multitalk_utils import get_attn_map_with_target
 import logging
 try:
     from sageattention import sageattn
-    USE_SAGEATTN = True
-    logging.info("Using sageattn")
+    SAGEATTN_AVAILABLE = True
 except:
-    USE_SAGEATTN = False
+    SAGEATTN_AVAILABLE = False
+
+# FlashAttention is the quality-preserving default. SageAttention quantizes part
+# of attention and therefore must never be enabled merely because it is installed.
+USE_SAGEATTN = False
+
+
+def set_attention_backend(backend):
+    global USE_SAGEATTN
+    if backend not in ('flash', 'sage'):
+        raise ValueError("attention backend must be 'flash' or 'sage'")
+    if backend == 'sage' and not SAGEATTN_AVAILABLE:
+        raise RuntimeError('SageAttention was requested but is not installed')
+    USE_SAGEATTN = backend == 'sage'
+    logging.info("Using %s attention", backend)
 
 __all__ = ['WanModel']
 
@@ -54,7 +67,9 @@ def rope_params(max_seq_len, dim, theta=10000):
 def rope_apply(x, grid_sizes, freqs):
     s, n, c = x.size(1), x.size(2), x.size(3) // 2
 
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    precomputed = isinstance(freqs, (list, tuple))
+    if not precomputed:
+        freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
@@ -62,18 +77,37 @@ def rope_apply(x, grid_sizes, freqs):
 
         x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
             s, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
-        freqs_i = freqs_i.to(device=x_i.device)
+        if precomputed:
+            freqs_i = freqs[i]
+        else:
+            freqs_i = torch.cat([
+                freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(seq_len, 1, -1).to(device=x_i.device)
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         output.append(x_i)
     return torch.stack(output).float()
+
+
+def precompute_rope_frequencies(grid_sizes, freqs, device):
+    """Build the identical 3-D RoPE grid once instead of once per Q/K/block."""
+    head_dim = freqs.shape[1]
+    parts = freqs.split([
+        head_dim - 2 * (head_dim // 3),
+        head_dim // 3,
+        head_dim // 3,
+    ], dim=1)
+    result = []
+    for f, h, w in grid_sizes.tolist():
+        result.append(torch.cat([
+            parts[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            parts[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            parts[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(f * h * w, 1, -1).to(device=device))
+    return result
 
 
 class WanRMSNorm(nn.Module):
@@ -518,12 +552,15 @@ class WanModel(ModelMixin, ConfigMixin):
 
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = torch.cat([
+        freqs = torch.cat([
             rope_params(1024, d - 4 * (d // 6)),
             rope_params(1024, 2 * (d // 6)),
             rope_params(1024, 2 * (d // 6))
         ],
                                dim=1)
+        self.register_buffer('freqs', freqs, persistent=False)
+        self._rope_cache_key = None
+        self._rope_cache = None
 
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
@@ -595,18 +632,36 @@ class WanModel(ModelMixin, ConfigMixin):
     def disable_teacache(self):
         self.enable_teacache = False
 
+    def set_block_swap_manager(self, manager):
+        self.block_swap_manager = manager
+        manager.prepare()
+        manager.log_configuration()
+
+    def _run_blocks(self, x, kwargs):
+        manager = getattr(self, 'block_swap_manager', None)
+        try:
+            for index, block in enumerate(self.blocks):
+                if manager is not None:
+                    manager.before_block(index)
+                x = block(x, **kwargs)
+        finally:
+            if manager is not None:
+                manager.after_forward()
+        return x
+
     def forward(
             self,
             x,
             t,
-            context,
-            seq_len,
+            context=None,
+            seq_len=None,
             clip_fea=None,
             y=None,
             audio=None,
             ref_target_masks=None,
+            condition_cache=None,
         ):
-        assert clip_fea is not None and y is not None
+        assert y is not None
 
         _, T, H, W = x[0].shape
         N_t = T // self.patch_size[0]
@@ -615,7 +670,9 @@ class WanModel(ModelMixin, ConfigMixin):
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
-        x[0] = x[0].to(context[0].dtype)
+        input_dtype = (context[0].dtype if context is not None
+                       else condition_cache['context'].dtype)
+        x[0] = x[0].to(input_dtype)
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -629,6 +686,12 @@ class WanModel(ModelMixin, ConfigMixin):
                       dim=1) for u in x
         ])
 
+        rope_cache_key = (tuple(grid_sizes.flatten().tolist()), x.device)
+        if self._rope_cache_key != rope_cache_key:
+            self._rope_cache = precompute_rope_frequencies(
+                grid_sizes, self.freqs, x.device)
+            self._rope_cache_key = rope_cache_key
+
         # time embeddings
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
@@ -636,46 +699,21 @@ class WanModel(ModelMixin, ConfigMixin):
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # text embedding
+        if condition_cache is None:
+            condition_cache = self.prepare_condition(
+                context=context,
+                clip_fea=clip_fea,
+                audio=audio,
+                ref_target_masks=ref_target_masks,
+                grid_size=(N_h, N_w),
+                dtype=x.dtype,
+                device=x.device,
+            )
+        context = condition_cache['context']
         context_lens = None
-        context = self.text_embedding(
-            torch.stack([
-                torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                for u in context
-            ]))
-
-        # clip embedding
-        if clip_fea is not None:
-            context_clip = self.img_emb(clip_fea) 
-            context = torch.concat([context_clip, context], dim=1).to(x.dtype)
-
-        
-        audio_cond = audio.to(device=x.device, dtype=x.dtype)
-        first_frame_audio_emb_s = audio_cond[:, :1, ...] 
-        latter_frame_audio_emb = audio_cond[:, 1:, ...] 
-        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) 
-        middle_index = self.audio_window // 2
-        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
-        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
-        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
-        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
-        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) 
-        human_num = len(audio_embedding)
-        audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
-
-
-        # convert ref_target_masks to token_ref_target_masks
-        if ref_target_masks is not None:
-            ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32) 
-            token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest') 
-            token_ref_target_masks = token_ref_target_masks.squeeze(0)
-            token_ref_target_masks = (token_ref_target_masks > 0)
-            token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1) 
-            token_ref_target_masks = token_ref_target_masks.to(x.dtype)
+        audio_embedding = condition_cache['audio_embedding']
+        token_ref_target_masks = condition_cache['token_ref_target_masks']
+        human_num = condition_cache['human_num']
 
         # teacache
         if self.enable_teacache:
@@ -725,7 +763,7 @@ class WanModel(ModelMixin, ConfigMixin):
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.freqs,
+            freqs=self._rope_cache,
             context=context,
             context_lens=context_lens,
             audio_embedding=audio_embedding,
@@ -738,28 +776,24 @@ class WanModel(ModelMixin, ConfigMixin):
                     x +=  self.previous_residual_cond
                 else:
                     ori_x = x.clone()
-                    for block in self.blocks:
-                        x = block(x, **kwargs)
+                    x = self._run_blocks(x, kwargs)
                     self.previous_residual_cond = x - ori_x
             elif self.cnt%3==1:
                 if not should_calc_drop_text:
                     x +=  self.previous_residual_drop_text
                 else:
                     ori_x = x.clone()
-                    for block in self.blocks:
-                        x = block(x, **kwargs)
+                    x = self._run_blocks(x, kwargs)
                     self.previous_residual_drop_text = x - ori_x
             else:
                 if not should_calc_uncond:
                     x +=  self.previous_residual_uncond
                 else:
                     ori_x = x.clone()
-                    for block in self.blocks:
-                        x = block(x, **kwargs)
+                    x = self._run_blocks(x, kwargs)
                     self.previous_residual_uncond = x - ori_x
         else:
-            for block in self.blocks:
-                x = block(x, **kwargs)
+            x = self._run_blocks(x, kwargs)
 
         # head
         x = self.head(x, e)
@@ -772,6 +806,88 @@ class WanModel(ModelMixin, ConfigMixin):
                 self.cnt = 0
 
         return torch.stack(x).float()
+
+    def prepare_condition(
+            self,
+            context,
+            clip_fea,
+            audio,
+            ref_target_masks,
+            grid_size,
+            dtype,
+            device,
+            shared_cache=None,
+        ):
+        """Project timestep-invariant conditioning once per generated clip.
+
+        These tensors were previously rebuilt for every denoising step and CFG
+        branch. Reusing them is numerically equivalent because the model is in
+        eval mode and all involved modules are deterministic feed-forward layers.
+        """
+        if shared_cache is None:
+            projected_context = self.text_embedding(
+                torch.stack([
+                    torch.cat(
+                        [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    for u in context
+                ]))
+            if clip_fea is not None:
+                context_clip = self.img_emb(clip_fea)
+                projected_context = torch.concat(
+                    [context_clip, projected_context], dim=1).to(dtype)
+        else:
+            projected_context = shared_cache['context']
+
+        audio_cond = audio.to(device=device, dtype=dtype)
+        first_frame_audio_emb_s = audio_cond[:, :1, ...]
+        latter_frame_audio_emb = audio_cond[:, 1:, ...]
+        latter_frame_audio_emb = rearrange(
+            latter_frame_audio_emb,
+            "b (n_t n) w s c -> b n_t n w s c",
+            n=self.vae_scale,
+        )
+        middle_index = self.audio_window // 2
+        latter_first_frame_audio_emb = rearrange(
+            latter_frame_audio_emb[:, :, :1, :middle_index + 1, ...],
+            "b n_t n w s c -> b n_t (n w) s c",
+        )
+        latter_last_frame_audio_emb = rearrange(
+            latter_frame_audio_emb[:, :, -1:, middle_index:, ...],
+            "b n_t n w s c -> b n_t (n w) s c",
+        )
+        latter_middle_frame_audio_emb = rearrange(
+            latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index + 1, ...],
+            "b n_t n w s c -> b n_t (n w) s c",
+        )
+        latter_frame_audio_emb_s = torch.concat(
+            [latter_first_frame_audio_emb,
+             latter_middle_frame_audio_emb,
+             latter_last_frame_audio_emb],
+            dim=2,
+        )
+        audio_embedding = self.audio_proj(
+            first_frame_audio_emb_s, latter_frame_audio_emb_s)
+        human_num = len(audio_embedding)
+        audio_embedding = torch.concat(
+            audio_embedding.split(1), dim=2).to(dtype)
+
+        token_ref_target_masks = (None if shared_cache is None else
+                                  shared_cache['token_ref_target_masks'])
+        if token_ref_target_masks is None and ref_target_masks is not None:
+            token_ref_target_masks = nn.functional.interpolate(
+                ref_target_masks.unsqueeze(0).to(torch.float32),
+                size=grid_size,
+                mode='nearest',
+            ).squeeze(0)
+            token_ref_target_masks = (token_ref_target_masks > 0).view(
+                token_ref_target_masks.shape[0], -1).to(dtype)
+
+        return {
+            'context': projected_context,
+            'audio_embedding': audio_embedding,
+            'token_ref_target_masks': token_ref_target_masks,
+            'human_num': human_num,
+        }
 
 
     def unpatchify(self, x, grid_sizes):

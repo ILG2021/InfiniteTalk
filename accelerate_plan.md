@@ -1,329 +1,274 @@
-# RTX 5090 × InfiniteTalk 推理提速完整优化方案
+# RTX 5090 × InfiniteTalk 推理优化方案
 
-> 基于代码级分析 + 社区调研，覆盖所有讨论过的优化路径
-
----
-
-## 一、当前配置诊断
-
-| 参数 | 当前值 | 状态 | 说明 |
-|------|--------|------|------|
-| 分辨率 | 1080p 最长边 | —— | infinitetalk-720 bucket，序列最长 |
-| audio cfg | 1.0 | ⚠️ | 口型弱，但已是最快 |
-| **text cfg** | **2.0** | 🔴 **错误** | 触发3次前向，与lightx2v矛盾 |
-| LoRA | lightx2v ×2 | ✅ | 步数蒸馏，5步推理 |
-| sample_steps | 5 | ✅ | 已最少 |
-| TeaCache | 未知 | ⚠️ | 5步推理下实际无效（见下分析）|
-| torch_gc() | 循环内每步调用 | 🔴 | 强制CUDA流同步，破坏流水线 |
-
-> [!CAUTION]
-> **最大单点问题：text_cfg=2.0 完全抵消了 lightx2v LoRA 的加速效果。**
-> - `text_guide_scale == 1.0` → 2次前向（cond + null_audio）
-> - `text_guide_scale != 1.0` → **3次前向（cond + drop_text + uncond）**
->
-> lightx2v 是在原始 Wan I2V（无音频条件）上做的流一致性蒸馏，只能省掉文本CFG那次前向。
-> 正确用法必须是 `text_cfg=1.0`，否则每步多跑一次完整14B模型。
+> 目标：RTX 5090 32GB 单卡，LightX2V 四步蒸馏推理，视频最长边约 1080；先获得最大吞吐，再根据固定质量门槛逐项加回必要计算。
 
 ---
 
-## 二、已研究但不适用的方案（排除项）
+## 一、速度优先策略与质量边界
 
-### TeaCache 对5步推理无效
+本项目必须使用 LightX2V，否则原始 40 步推理速度无法满足要求。因此这里不从最保守配置开始，而采用“最快档 → 质量回退档”的顺序：
 
-TeaCache 的 `ret_steps` 硬编码为 `5×3=15`，等于5步推理的总forward call数。
-每次调用都判断 `cnt < ret_steps` 为 True → 全程强制计算，**一次缓存都没有**。
+| 档位 | 配置 | 用途 |
+|---|---|---|
+| S0 极限速度 | LightX2V 4 步、text CFG 1、audio CFG 1、BF16 FlashAttention | 首轮性能基线 |
+| S1 口型增强 | S0 + audio CFG 2 | S0 口型或说话人归属不达标时使用 |
+| S2 严格复现 | S1 + `--deterministic` | 仅在必须逐 seed 稳定复现时使用 |
 
-```python
-# multitalk_model.py L583
-self.__class__.ret_steps = 5*3       # = 15（前15次call强制计算）
-self.__class__.cutoff_steps = sample_steps * 3  # = 15（总call数）
-# 结果：ret_steps >= cutoff_steps → 永远不进缓存分支
-```
+所有档位共同保持：
 
-即使修改 `ret_steps`，lightx2v 5步推理中每步跨越的 $\Delta t$ 极大，相邻步残差差异显著，TeaCache 的相似度假设不成立，质量和命中率都会下降。
+- `sample_steps=4`
+- `sample_shift=2`
+- `sample_text_guide_scale=1`
+- BF16 DiT 权重
+- FlashAttention 全局注意力
+- 不降低输出分辨率和帧数
+- 不使用 FP8/INT8 权重量化
+- 默认不使用 SageAttention、TeaCache、滑窗注意力或稀疏注意力替换
 
-**结论：lightx2v 5步 + TeaCache = 无效组合，不推荐开启。**
+S0 先保留图像生成主干的分辨率、四步采样、BF16 权重和完整注意力，只关闭额外 audio CFG 分支。它可能影响口型同步强度，因此必须通过质量门槛；不达标时只回退到 S1，不应直接增加采样步数或降低分辨率。
 
----
+### 分辨率说明
 
-### FastWan / VSA 稀疏注意力无法直接换
-
-FastVideo（Hao AI Lab）的 Video Sparse Attention (VSA)：
-- 两阶段稀疏：coarse pool 找重要 tile → fine attention 只在 tile 内计算
-- **在稀疏模式下重新微调过 Wan 原始 DiT 权重**
-
-架构冲突：
-
-```
-FastWan DiT（原始结构）:          InfiniteTalk DiT（修改版）:
-  self_attn → VSA kernel            self_attn（全局注意力）
-  cross_attn（文本/CLIP）           cross_attn（文本/CLIP）
-  ❌ 无音频层                       ✅ audio_cross_attn ← 独有
-                                     ✅ AudioProjModel  ← 独有
-```
-
-FastWan 的 state_dict 缺少 InfiniteTalk 的音频模块，**无法直接加载**。
-将 VSA kernel 移植到 InfiniteTalk 需要在音频条件下重新微调，工作量极大。
-
-**结论：等官方 InfiniteTalk 集成 VSA（已在 TODO 列表），目前不可行。**
+`infinitetalk-720` 是约 `960×960` 总像素面积的宽高比 bucket，并不是最长边限制。16:9 附近通常会选择约 `1280×704`，超宽画幅可能更长。如果“最长边 1080”是硬性输出规格，需要另行增加最大边约束；如果只是输入素材最长边为 1080，则无需修改 bucket。
 
 ---
 
-### Sliding Window 注意力推理换不等于训练换
+## 二、CFG 前向次数：LightX2V 最关键的速度开关
 
-代码已有参数通路（`window_size` 传入 Flash Attention 2），理论上可设：
+当前代码的真实分支数为：
 
-```python
-# wan_multitalk_14B.py
-multitalk_14B.window_size = (64, 64)  # 滑动窗口
-```
+| text CFG | audio CFG | 每步 DiT 前向次数 | 说明 |
+|---:|---:|---:|---|
+| `1` | `1` | **1 次** | 极限吞吐；没有额外 audio CFG 分支 |
+| `1` | `2` | **2 次** | 推荐质量配置；音频/口型引导更强 |
+| 非 `1` | 任意值 | **3 次** | cond + drop-text + uncond，不适合 LightX2V |
 
-但模型在 `window_size=(-1,-1)` 全局注意力下训练，推理时换局部注意力 = 分布外推理，
-口型同步和跨帧一致性会明显下降。不建议在未重训的情况下使用。
+必须保持 `sample_text_guide_scale=1`。`audio CFG=1` 与 `audio CFG=2` 的速度不是相同的：后者会增加一次完整 14B DiT 前向。
 
----
-
-## 三、可执行优化方案（按优先级排序）
-
-### 【P0】修正 text_cfg 参数（零代码，最大收益）
-
-```bash
-# 将命令行参数从：
---sample_text_guide_scale 2.0
-# 改为：
---sample_text_guide_scale 1.0
-```
-
-| 配置 | 前向次数/步 | 预期耗时/it |
-|------|-----------|------------|
-| text=2.0, audio=1.0（当前）| **3次** | ~70s |
-| text=1.0, audio=1.0 | **2次** | ~47s (**1.5×加速**) |
-| text=1.0, audio=4.0 | **2次** | ~47s（口型更准，同速）|
-
-> [!TIP]
-> text_cfg=1.0 + audio_cfg=4.0 是 lightx2v LoRA 的官方推荐配置：
-> 文本引导由 LoRA 蒸馏保证，音频引导由独立 CFG 控制，口型质量更好且速度相同。
+生产调优从 `audio CFG=1` 开始。对同一输入、同一 seed 检查口型同步、闭口准确性、停顿和多人说话切换；通过则直接采用 S0，失败才切换 `audio CFG=2`。这样质量成本只支付在确实需要的任务上。
 
 ---
 
-### 【P0】安装 SageAttention（一行命令，最接近稀疏注意力的效果）
+## 三、已落地的质量等价优化
 
-代码已有自动检测集成，安装即用：
+### 1. 删除热循环中的 CUDA 全局清缓存
 
-```bash
-pip install sageattention
-```
+原代码在每次 DiT 前向后调用 `torch.cuda.empty_cache()` 和 `torch.cuda.ipc_collect()`；参考注意力图内部还会在 40 个 Transformer block 中反复清缓存。这些调用破坏 CUDA allocator 复用并造成频繁同步。
 
-```python
-# multitalk_model.py L17-22 — 自动启用
-try:
-    from sageattention import sageattn
-    USE_SAGEATTN = True   # ← 安装后自动 True
-except:
-    USE_SAGEATTN = False
-```
+已完成：
 
-SageAttention 的加速原理：将 Q/K 量化到 INT8，保留 V 精度，等效于近似注意力。
-RTX 5090 INT8 算力 ≈ FP16 的 2×，注意力计算加速 **1.3–1.5×**，质量损失极低。
+- 删除去噪循环内每次 CFG 前向后的 `torch_gc()`。
+- 删除参考注意力图计算内部的 `torch_gc()`。
+- 删除无必要的 chunk 内清缓存与同步。
+- 只在 T5、CLIP、DiT 确实被卸载、下一阶段需要回收显存时保留 `empty_cache()`。
+- 删除无意义的 `ipc_collect()`。
 
-**这是当前能用的最接近「稀疏注意力」效果的方案，且无需重训。**
+这部分不改变任何模型运算。
 
----
+### 2. 缓存时间步无关的条件投影
 
-### 【P1】修复 float64 RoPE（2行代码，隐藏的最大性能杀手）
+原实现会在每个采样步、每个 CFG 分支重复计算 T5 文本投影、CLIP 图像投影、AudioProjModel 音频投影，以及人像 mask 到 token mask 的转换。这些结果在同一个视频 chunk 的四个去噪步中保持不变，现在每个条件分支只计算一次并复用。
 
-#### [MODIFY] [multitalk_model.py](file:///d:/vibecoding/InfiniteTalk/wan/modules/multitalk_model.py)
+对于 LightX2V 常用的 `text CFG=1, audio CFG=2`，cond 与 null-audio 分支还会共享文本、CLIP 和空间 mask 投影，只分别计算不同的音频条件。
 
-```python
-# rope_apply() L63 — 当前代码（极慢！）
-x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(s, n, -1, 2))
-# RTX 5090 是消费级 GPU，FP64 算力仅为 FP32 的 1/64
+### 3. RoPE 频率常驻 CUDA，并缓存三维 RoPE 网格
 
-# 修改为 float32（精度影响 < 0.1%）
-x_i = torch.view_as_complex(x[i, :s].to(torch.float32).reshape(s, n, -1, 2))
-```
+原 `self.freqs` 不是注册 buffer，可能在每层 Q/K 中重复 CPU→GPU 搬运；三维 RoPE 网格也会在每个 block、每个 CFG 分支、每个采样步重新执行 complex128 拼接。
 
-同时修改 `rope_params()` 返回类型（避免 freqs 仍是 complex128）：
+已完成：
 
-```python
-# L44-50 当前
-freqs = torch.outer(
-    torch.arange(max_seq_len),
-    1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim)))
+- 将 `freqs` 注册为非持久 buffer，使其随模型移动并在显存管理模式下常驻 CUDA。
+- 按 `(T,H,W,device)` 缓存完整三维 RoPE 网格。
+- 保留原始 float64/complex128 RoPE 计算精度，不采用 float32 近似。
 
-# 修改
-freqs = torch.outer(
-    torch.arange(max_seq_len),
-    1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)))
-```
+### 4. 明确控制注意力后端
 
-预期加速：**每次前向 +10–30%**（5090 FP64 性能极差，这一改动效果显著）。
+旧代码只要检测到 SageAttention 已安装就自动启用。SageAttention 会量化注意力中的部分计算，不能归入严格无损路径。
+
+现在默认使用 `--attention_backend flash`，SageAttention 只能通过 `--attention_backend sage` 显式启用。质量优先生产配置禁止使用 `sage`。
+
+### 5. 推理模式与性能测量
+
+- 将核心推理上下文改为 `torch.inference_mode()`。
+- 默认启用 `torch.backends.cudnn.benchmark`，固定尺寸下由 cuDNN 选择最快 kernel。
+- 新增 `--deterministic` 用于严格复现。
+- 新增 `--profile`，记录总 CUDA 时间、每帧耗时、峰值 allocated/reserved 显存。
 
 ---
 
-### 【P1】移除去噪循环内的 torch_gc()
+## 四、RTX 5090 显存策略：WanVideoWrapper 风格块交换
 
-#### [MODIFY] [multitalk.py](file:///d:/vibecoding/InfiniteTalk/wan/multitalk.py)
+14B DiT 的 BF16 权重约占 28GB，1080 级视频的激活、RoPE 缓存、latent 和 VAE 还需要额外空间，因此采用 WanVideoWrapper 的完整 transformer block 交换机制。
 
-当前代码（L715-729）每次前向后都调用 `torch_gc()`（= `empty_cache` + `ipc_collect`）：
+推荐起点：
 
-```python
-# 去噪循环内（L709 for 循环中）：
-noise_pred_cond = self.model(...)
-torch_gc()           # ← 删除
-noise_pred_drop_audio = self.model(...)
-torch_gc()           # ← 删除
+```text
+blocks_to_swap=20
+prefetch_blocks=1
+block_swap_non_blocking=false
 ```
 
-RTX 5090 有 32GB VRAM，5步×1080p 的14B模型（bfloat16 ≈ 28GB）加激活值仍有余裕。
-`empty_cache` 强制 CUDA 流同步，每调用一次停顿数十毫秒。
+`blocks_to_swap=N` 表示把 DiT 最后的 N 个 blocks 放在 CPU；前面的 blocks、embedding、adapter 和 head 常驻 GPU。推理进入一个交换 block 前，把它整体搬到 GPU，并在 CUDA stream 上预取后续 block；执行完当前 DiT forward 后，释放当前及预取 block。这里交换的是完整 block，不是逐个 Linear/Norm 的动态包装。
 
-修改：**保留循环外（VAE/CLIP卸载前后）的 `torch_gc()`，删除循环内的所有调用。**
+调优流程：
 
-预期加速：**+10–15%**。
+1. 先固定 `blocks_to_swap=20`、`prefetch_blocks=1`，用 `--profile` 建立速度和峰值显存基线。
+2. 若显存有余量，依次尝试 `16`、`12`、`8`；数值越小，GPU 常驻 block 越多，通常越快。
+3. 若 OOM，依次尝试 `24`、`28`；数值越大，CPU↔GPU 搬运越多，通常越慢。
+4. `prefetch_blocks=1` 是速度/显存的起点；只有 PCIe 搬运明显成为瓶颈时才测试 `2`。
+5. `block_swap_non_blocking=true` 仅在确认 CPU 权重存储已适合异步拷贝后测试；否则先保持 false，避免异步搬运收益不稳定。
+
+旧的 `num_persistent_param_in_dit` 是逐模块 VRAM manager 的兼容路径，不要与 `blocks_to_swap` 同时使用。块交换模式当前要求单卡，不与 USP/FSDP 混用。
+
+不建议在严格质量路径中用 FP8/INT8 来换取全模型常驻。
 
 ---
 
-### 【P2】关闭 offload_model
+## 五、推荐命令
 
-```bash
---offload_model false
+### S0 极限速度：LightX2V 四步 + audio CFG 1
+
+```powershell
+python generate_infinitetalk.py `
+    --ckpt_dir weights/Wan2.1-I2V-14B-480P `
+    --wav2vec_dir weights/chinese-wav2vec2-base `
+    --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors `
+    --lora_dir weights/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors `
+    --lora_scale 1.0 `
+    --input_json examples/single_example_image.json `
+    --size infinitetalk-720 `
+    --sample_steps 4 `
+    --sample_text_guide_scale 1 `
+    --sample_audio_guide_scale 1 `
+    --blocks_to_swap 25 `
+    --prefetch_blocks 1 `
+    --attention_backend sage `
+    --offload_model true `
+    --profile `
+    --mode streaming `
+    --motion_frame 9 `
+    --save_file infinitetalk_lightx2v_5090_fast
 ```
 
-当前默认 `offload_model=True`，每次模型前向前后都做 CPU↔GPU 数据搬运。
-5090 32GB 在未开量化时可能刚好够用（28GB模型 + 激活值），建议先测试：
+### S1 口型质量回退：audio CFG 2
 
+仅将下面一项改为：
+
+```powershell
+--sample_audio_guide_scale 2
 ```
-显存占用估算：
-  DiT 14B bfloat16  ≈ 28 GB
-  VAE               ≈  1 GB
-  T5 / CLIP         ≈  2 GB（offload后CPU）
-  激活值/latent     ≈  2 GB
-  总计              ≈ 33 GB  ← 略超，建议配合 int8 量化使用
+
+该配置每步执行两次 DiT。只有 S0 的口型同步、闭口准确性或多人说话人归属不达标时才启用。
+
+### SageAttention 实验档
+
+将 S0 命令中的 `--attention_backend flash` 替换为 `sage`。RTX 5090 使用 SageAttention 需要 CUDA 12.8 或更高版本。推荐安装 SageAttention 2.2.0：
+
+```powershell
+pip install sageattention==2.2.0 --no-build-isolation
+```
+
+SageAttention 会量化注意力计算，因此这是近似加速档，必须与 S0 FlashAttention 输出做口型、身份和时序一致性 A/B。当前暂不叠加 `torch.compile`，先单独测量 SageAttention 的实际收益。
+
+### 不建议作为第一回退项
+
+不要先增加采样步数、切换 40 步基础模型、降低分辨率或改变 motion frame。这些改动的成本或影响范围都大于单独恢复 audio CFG。质量回退顺序应为：
+
+```text
+audio CFG 1 → audio CFG 2 → deterministic（仅复现需求）
 ```
 
 ---
 
-### 【P2】int8 量化（官方已支持）
+## 六、5090 基准测试矩阵
 
-```bash
---quant int8
-```
+所有测试必须固定输入、seed、输出帧数和后台环境，并至少运行两次；首次运行包含 kernel 预热，不纳入最终对比。
 
-将 DiT 量化为 INT8，显存节省约 50%（28GB → 14GB），腾出空间关闭 offload：
+| 组别 | audio CFG | block swap | attention | 目的 |
+|---|---:|---:|---|---|
+| A | 1 | 20 blocks / prefetch 1 | Flash | 极限速度基线及质量首检 |
+| B | 1 | 16 blocks / prefetch 1 | Flash | 测试更高 GPU 常驻量 |
+| C | 1 | 24 blocks / prefetch 1 | Flash | 测试更低显存档 |
+| D | 2 | A/B 中最优配置 | Flash | S0 不达标时的口型质量回退 |
 
-```
-  DiT 14B int8      ≈ 14 GB
-  其他              ≈  5 GB
-  总计              ≈ 19 GB  ← 充裕，offload 可安全关闭
-```
+记录以下指标：
 
-速度影响：INT8 矩阵乘法在 5090 上理论更快，实测约 **+10–20%**。
+- `PROFILE total`
+- `sec/frame`
+- `peak_allocated`
+- `peak_reserved`
+- 首帧主体一致性
+- 口型同步和闭口准确性
+- 长视频 chunk 接缝
+- 多人场景说话人归属
 
----
-
-### 【P3】BatchCFG：将2次前向合并为1次（需代码改动）
-
-当 text_cfg=1.0 时，当前代码顺序执行两次独立前向：
-
-```python
-noise_pred_cond       = self.model(latent, t, **arg_c)
-noise_pred_drop_audio = self.model(latent, t, **arg_null_audio)
-```
-
-可改为 batch=2 合并：
-
-```python
-# 拼接 batch 维度
-latent_batch = torch.cat([latent, latent], dim=0)
-context_batch = torch.cat([arg_c['context'][0], arg_null_audio['context'][0]], dim=0)
-audio_batch = torch.cat([arg_c['audio'], arg_null_audio['audio']], dim=0)
-# 单次前向
-preds = self.model_batch(latent_batch, t, ...)
-noise_pred_cond, noise_pred_drop_audio = preds.chunk(2)
-```
-
-优点：消除第2次前向的 Python 调度和 kernel 启动开销，Tensor Core 利用率更高。
-预期加速：**+15–25%**（非2倍，因带宽是瓶颈）。
+当前开发机是 RTX 4060 Laptop，且缺少项目完整 PyTorch/权重运行环境，因此本文不填写虚假的 RTX 5090 加速倍数。最终数据必须由目标 5090 使用 `--profile` 实测。
 
 ---
 
-### 【P3】torch.compile 内核融合
+## 七、商业级加速方案状态矩阵
 
-```python
-# multitalk.py，Pipeline.__init__ 末尾
-self.model = torch.compile(
-    self.model,
-    mode="max-autotune",
-    dynamic=False,   # 分辨率固定时设 False，触发更激进的自动调优
-)
-```
+下面按“先无损工程优化、再进入近似计算”的顺序记录商业部署路线。`[x]` 表示当前项目已经有代码或可用开关；`[ ]` 表示尚未实现或尚未完成目标 5090 的验收。
 
-首次调用会有约 1-3 分钟编译期，之后每次推理受益。
-预期加速：**+10–20%**。
+### 已支持或已落地
 
----
+- [x] LightX2V 四步蒸馏推理
+- [x] BF16 DiT 推理
+- [x] FlashAttention 后端（当前以 FlashAttention 2 为 5090 稳定基线）
+- [x] 条件投影缓存：文本、CLIP、audio 和静态 mask
+- [x] RoPE buffer 常驻 CUDA 及三维 RoPE 网格缓存
+- [x] `torch.inference_mode()`
+- [x] 固定尺寸下的 cuDNN benchmark
+- [x] 完整 DiT block CPU↔GPU 交换
+- [x] CUDA stream 预取后续 block，`prefetch_blocks=1`
+- [x] `--profile` 性能和峰值显存统计
+- [x] `audio CFG=1/2` 速度优先与质量回退档
 
-## 四、优先级总览
+### 商业级但尚未完成
 
-| 优先级 | 优化项 | 操作难度 | 预期加速 | 风险 |
-|-------|--------|---------|---------|------|
-| **P0** | ✅ text_cfg: 2.0 → 1.0 | 改参数 | **1.5×** | 无 |
-| **P0** | ✅ 安装 SageAttention | pip 一行 | **1.3–1.5×** | 极低 |
-| **P1** | ✅ rope float64 → float32 | 2行代码 | **1.1–1.3×** | 极低 |
-| **P1** | ✅ 移除循环内 torch_gc() | 3行代码 | **1.1–1.15×** | 极低 |
-| **P2** | ⚙️ int8 量化 + 关闭 offload | 参数改动 | **1.15–1.3×** | 低 |
-| **P3** | 🔨 BatchCFG（合并两次前向）| ~30行代码 | **1.15–1.25×** | 中（需测试）|
-| **P3** | 🔨 torch.compile | 3行代码 | **1.1–1.2×** | 低（需预热）|
-| **❌** | TeaCache（5步无效）| — | 0 | — |
-| **❌** | FastWan/VSA（架构不兼容）| — | — | 高 |
-| **⏳** | Sliding Window 稀疏注意力 | 需重训 | — | 高 |
+- [ ] pinned host memory 权重池，配合真正异步 H2D/D2H 搬运
+- [ ] block swap double-buffer 和 PCIe 搬运/计算流水线调度
+- [ ] 每个固定分辨率/帧数 bucket 的 CUDA Graph capture
+- [ ] 仅编译 DiT block 内部的 `torch.compile`
+- [ ] CFG batch fusion：一次 batch=2 完成 cond/uncond
+- [ ] 跨 timestep 的 cross-attention K/V 缓存
+- [ ] 融合 QKV、RMSNorm、MLP 等 DiT 专用 kernel
+- [ ] TensorRT 或 AOTInductor 固定 shape engine
+- [ ] 多卡 tensor parallel / pipeline parallel
+- [ ] VAE 编解码与下一 chunk 的流水线重叠
 
-**理论最优叠加（P0+P0+P1+P1+P2）：**
-$$1.5 \times 1.4 \times 1.2 \times 1.12 \times 1.2 \approx \mathbf{3.6\times}$$
-$$70s/it \rightarrow \approx 19s/it$$
+### 需要画质 A/B 的近似加速
 
----
+- [ ] SageAttention 3；暂不考虑，属于 4-bit/FP4 近似注意力路径，当前项目的 `sage` 入口也不是 SageAttention 3 专用实现
+- [ ] FP8 权重或 FP8 activation
+- [ ] INT8 weight-only / SmoothQuant
+- [ ] token merge、时空稀疏 attention、跳步缓存
+- [ ] 进一步的蒸馏、少步采样或结构化剪枝
 
-## 五、推荐的最终命令
-
-```bash
-# 安装加速依赖（一次性）
-pip install sageattention
-
-# 推理命令（优化后）
-python generate_infinitetalk.py \
-    --ckpt_dir weights/Wan2.1-I2V-14B-480P \
-    --wav2vec_dir 'weights/chinese-wav2vec2-base' \
-    --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors \
-    --lora_dir weights/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors \
-    --input_json examples/single_example_image.json \
-    --lora_scale 1.0 \
-    --size infinitetalk-720 \
-    --sample_text_guide_scale 1.0 \
-    --sample_audio_guide_scale 1.0 \
-    --sample_steps 4 \
-    --mode streaming \
-    --motion_frame 9 \
-    --sample_shift 2 \
-    --num_persistent_param_in_dit 0 \
-    --save_file infinitetalk_res_lora
-```
-
-> [!NOTE]
-> `audio_cfg=4.0`（而非 1.0）在 text_cfg=1.0 时可以显著改善口型同步，且速度与 audio_cfg=1.0 完全相同（都是2次前向）。建议配合使用。
+注意：RTX 5090 不应把官方 FlashAttention 3 作为默认后端。FA3 的官方实现主要针对 Hopper；5090 的稳定基线应使用 FlashAttention 2 或 PyTorch SDPA。SageAttention、FP8/INT8 和稀疏注意力均不属于严格无损路径。
 
 ---
 
-## 六、代码改动清单
+## 八、不采用或暂缓的方案
 
-### [MODIFY] [multitalk_model.py](file:///d:/vibecoding/InfiniteTalk/wan/modules/multitalk_model.py)
-- `rope_params()` L47：`torch.float64` → `torch.float32`
-- `rope_apply()` L63：`.to(torch.float64)` → `.to(torch.float32)`
+| 方案 | 结论 | 原因 |
+|---|---|---|
+| TeaCache | 不采用 | 四步采样没有有效缓存窗口，且跳步会改变结果 |
+| SageAttention 3 | 暂不考虑 | 4-bit/FP4 近似注意力，画质风险高于当前无损优先路线 |
+| FP8/INT8 DiT | 严格质量路径不采用 | 改变权重数值 |
+| RoPE float32 | 不采用 | 虽可能更快，但不保证数值等价 |
+| Attention Sliding Window | 不采用 | 这里指注意力滑动窗口；不是 InfiniteTalk 已有的长视频 chunk 滑动窗口，模型按全局注意力训练，推理替换会改变分布 |
+| FastWan/VSA | 暂缓 | InfiniteTalk 音频模块不兼容，需要重新训练/微调 |
+| Batch CFG | 暂缓 | 1080 级 batch=2 激活显存过高，5090 32GB 风险大 |
 
-### [MODIFY] [multitalk.py](file:///d:/vibecoding/InfiniteTalk/wan/multitalk.py)
-- 去噪 for 循环内（L717, L722, L726, L729）：删除 `torch_gc()` 调用
+---
 
-### 无需改代码
-- `pip install sageattention` → 自动启用
-- 命令行参数修改 → 立即生效
+## 九、已修改文件
+
+- `wan/multitalk.py`：移除热路径清缓存、缓存 CFG 条件、启用 inference mode 和 cuDNN benchmark，接入 WanVideoWrapper 风格块交换。
+- `wan/modules/multitalk_model.py`：Flash/Sage 显式选择、RoPE buffer/网格缓存、静态条件预计算及 block swap 调度入口。
+- `src/vram_management/block_swap.py`：完整 DiT block 的 CPU↔GPU 交换与 CUDA stream 预取。
+- `wan/utils/multitalk_utils.py`：移除参考注意力图内部 CUDA 清缓存。
+- `generate_infinitetalk.py`：新增 `--attention_backend`、`--deterministic`、`--profile`、`--blocks_to_swap` 及块交换参数。
+
+代码已通过 Python 语法编译与 `git diff --check`。RTX 5090 的实际耗时和画质验收仍需在目标机器完成。

@@ -214,6 +214,24 @@ def _parse_args():
         help="Maximum parameter quantity retained in video memory, small number to reduce VRAM required",
     )
     parser.add_argument(
+        "--blocks_to_swap",
+        type=int,
+        default=None,
+        help="Number of trailing DiT transformer blocks to swap to CPU (Wan block-swap mode).",
+    )
+    parser.add_argument(
+        "--prefetch_blocks",
+        type=int,
+        default=1,
+        help="Number of swapped blocks to prefetch ahead on a CUDA stream.",
+    )
+    parser.add_argument(
+        "--block_swap_non_blocking",
+        type=str2bool,
+        default=False,
+        help="Use non-blocking CPU/GPU block copies; requires suitable pinned host memory.",
+    )
+    parser.add_argument(
         "--audio_mode",
         type=str,
         default="localfile",
@@ -266,6 +284,27 @@ def _parse_args():
         type=str,
         default=None,
         help="Quantization type, must be 'int8' or 'fp8'."
+    )
+    parser.add_argument(
+        "--attention_backend",
+        type=str,
+        default="flash",
+        choices=["flash", "sage"],
+        help=("Attention backend. 'flash' preserves the original precision; "
+              "'sage' is an explicitly opt-in approximate backend.")
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        default=False,
+        help=("Use deterministic cuDNN kernels for reproducibility. This can be "
+              "slower and does not improve output quality.")
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help="Log end-to-end CUDA time and peak allocated/reserved VRAM."
     )
     
     args = parser.parse_args()
@@ -457,6 +496,17 @@ def generate(args):
     device = local_rank
     _init_logging(rank)
 
+    torch.backends.cudnn.deterministic = args.deterministic
+    torch.backends.cudnn.benchmark = not args.deterministic
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(device)
+        logging.info(
+            "CUDA device: %s, %.1f GiB VRAM, deterministic=%s",
+            props.name,
+            props.total_memory / 2**30,
+            args.deterministic,
+        )
+
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         logging.info(
@@ -536,12 +586,22 @@ def generate(args):
         lora_scales=args.lora_scale,
         quant=args.quant,
         dit_path=args.dit_path,
-        infinitetalk_dir=args.infinitetalk_dir
+        infinitetalk_dir=args.infinitetalk_dir,
+        attention_backend=args.attention_backend,
     )
     if args.num_persistent_param_in_dit is not None:
+        if args.blocks_to_swap is not None:
+            raise ValueError(
+                "Use either --blocks_to_swap or --num_persistent_param_in_dit, not both")
         wan_i2v.vram_management = True
         wan_i2v.enable_vram_management(
             num_persistent_param_in_dit=args.num_persistent_param_in_dit
+        )
+    if args.blocks_to_swap is not None:
+        wan_i2v.enable_block_swap(
+            blocks_to_swap=args.blocks_to_swap,
+            prefetch_blocks=args.prefetch_blocks,
+            use_non_blocking=args.block_swap_non_blocking,
         )
     
     generated_list = []
@@ -625,6 +685,12 @@ def generate(args):
         
         input_clip['cond_audio'] = cond_audio
                     
+        if args.profile:
+            torch.cuda.reset_peak_memory_stats(device)
+            profile_start = torch.cuda.Event(enable_timing=True)
+            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_start.record()
+
         video = wan_i2v.generate_infinitetalk(
             input_clip,
             size_buckget=args.size,
@@ -639,6 +705,21 @@ def generate(args):
             max_frames_num=args.frame_num if args.mode == 'clip' else args.max_frame_num,
             color_correction_strength = args.color_correction_strength,
             extra_args=args,
+            )
+
+        if args.profile:
+            profile_end.record()
+            profile_end.synchronize()
+            elapsed_s = profile_start.elapsed_time(profile_end) / 1000.0
+            generated_frames = video.shape[1] if video is not None else 0
+            logging.info(
+                "PROFILE total=%.3fs frames=%d sec/frame=%.4f "
+                "peak_allocated=%.2fGiB peak_reserved=%.2fGiB",
+                elapsed_s,
+                generated_frames,
+                elapsed_s / max(generated_frames, 1),
+                torch.cuda.max_memory_allocated(device) / 2**30,
+                torch.cuda.max_memory_reserved(device) / 2**30,
             )
         
         generated_list.append(video)
