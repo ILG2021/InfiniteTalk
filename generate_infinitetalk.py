@@ -20,7 +20,6 @@ import wan
 from wan.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.utils.utils import str2bool, is_video, split_wav_librosa
 from wan.utils.multitalk_utils import save_video_ffmpeg
-from kokoro import KPipeline
 from transformers import Wav2Vec2FeatureExtractor
 from src.audio_analysis.wav2vec2 import Wav2Vec2Model
 from wan.utils.segvideo import shot_detect
@@ -31,7 +30,6 @@ import pyloudnorm as pyln
 import numpy as np
 from einops import rearrange
 import soundfile as sf
-import re
 
 
 def _validate_args(args):
@@ -235,8 +233,8 @@ def _parse_args():
         "--audio_mode",
         type=str,
         default="localfile",
-        choices=['localfile', 'tts'],
-        help="localfile: audio from local wav file, tts: audio from TTS")
+        choices=['localfile'],
+        help="audio source: local wav file")
     parser.add_argument(
         "--use_teacache",
         action="store_true",
@@ -416,78 +414,6 @@ def audio_prepare_single(audio_path, sample_rate=16000):
         human_speech_array, sr = librosa.load(audio_path, sr=sample_rate)
         human_speech_array = loudness_norm(human_speech_array, sr)
         return human_speech_array
-
-def process_tts_single(text, save_dir, voice1):    
-    s1_sentences = []
-
-    pipeline = KPipeline(lang_code='a', repo_id='weights/Kokoro-82M')
-
-    voice_tensor = torch.load(voice1, weights_only=True)
-    generator = pipeline(
-        text, voice=voice_tensor, # <= change voice here
-        speed=1, split_pattern=r'\n+'
-    )
-    audios = []
-    for i, (gs, ps, audio) in enumerate(generator):
-        audios.append(audio)
-    audios = torch.concat(audios, dim=0)
-    s1_sentences.append(audios)
-    s1_sentences = torch.concat(s1_sentences, dim=0)
-    save_path1 =f'{save_dir}/s1.wav'
-    sf.write(save_path1, s1_sentences, 24000) # save each audio file
-    s1, _ = librosa.load(save_path1, sr=16000)
-    return s1, save_path1
-    
-   
-
-def process_tts_multi(text, save_dir, voice1, voice2):
-    pattern = r'\(s(\d+)\)\s*(.*?)(?=\s*\(s\d+\)|$)'
-    matches = re.findall(pattern, text, re.DOTALL)
-    
-    s1_sentences = []
-    s2_sentences = []
-
-    pipeline = KPipeline(lang_code='a', repo_id='weights/Kokoro-82M')
-    for idx, (speaker, content) in enumerate(matches):
-        if speaker == '1':
-            voice_tensor = torch.load(voice1, weights_only=True)
-            generator = pipeline(
-                content, voice=voice_tensor, # <= change voice here
-                speed=1, split_pattern=r'\n+'
-            )
-            audios = []
-            for i, (gs, ps, audio) in enumerate(generator):
-                audios.append(audio)
-            audios = torch.concat(audios, dim=0)
-            s1_sentences.append(audios)
-            s2_sentences.append(torch.zeros_like(audios))
-        elif speaker == '2':
-            voice_tensor = torch.load(voice2, weights_only=True)
-            generator = pipeline(
-                content, voice=voice_tensor, # <= change voice here
-                speed=1, split_pattern=r'\n+'
-            )
-            audios = []
-            for i, (gs, ps, audio) in enumerate(generator):
-                audios.append(audio)
-            audios = torch.concat(audios, dim=0)
-            s2_sentences.append(audios)
-            s1_sentences.append(torch.zeros_like(audios))
-    
-    s1_sentences = torch.concat(s1_sentences, dim=0)
-    s2_sentences = torch.concat(s2_sentences, dim=0)
-    sum_sentences = s1_sentences + s2_sentences
-    save_path1 =f'{save_dir}/s1.wav'
-    save_path2 =f'{save_dir}/s2.wav'
-    save_path_sum = f'{save_dir}/sum.wav'
-    sf.write(save_path1, s1_sentences, 24000) # save each audio file
-    sf.write(save_path2, s2_sentences, 24000)
-    sf.write(save_path_sum, sum_sentences, 24000)
-
-    s1, _ = librosa.load(save_path1, sr=16000)
-    s2, _ = librosa.load(save_path2, sr=16000)
-    # sum, _ = librosa.load(save_path_sum, sr=16000)
-    return s1, s2, save_path_sum
 
 def generate(args):
     rank = int(os.getenv("RANK", 0))

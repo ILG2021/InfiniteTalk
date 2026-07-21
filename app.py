@@ -22,7 +22,6 @@ import wan
 from wan.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.utils.utils import cache_image, cache_video, str2bool
 from wan.utils.multitalk_utils import save_video_ffmpeg
-from kokoro import KPipeline
 from transformers import Wav2Vec2FeatureExtractor
 from src.audio_analysis.wav2vec2 import Wav2Vec2Model
 
@@ -31,7 +30,6 @@ import pyloudnorm as pyln
 import numpy as np
 from einops import rearrange
 import soundfile as sf
-import re
 
 def _validate_args(args):
     # Basic check
@@ -356,78 +354,6 @@ def audio_prepare_single(audio_path, sample_rate=16000):
         human_speech_array = loudness_norm(human_speech_array, sr)
         return human_speech_array
 
-def process_tts_single(text, save_dir, voice1):    
-    s1_sentences = []
-
-    pipeline = KPipeline(lang_code='a', repo_id='weights/Kokoro-82M')
-
-    voice_tensor = torch.load(voice1, weights_only=True)
-    generator = pipeline(
-        text, voice=voice_tensor, # <= change voice here
-        speed=1, split_pattern=r'\n+'
-    )
-    audios = []
-    for i, (gs, ps, audio) in enumerate(generator):
-        audios.append(audio)
-    audios = torch.concat(audios, dim=0)
-    s1_sentences.append(audios)
-    s1_sentences = torch.concat(s1_sentences, dim=0)
-    save_path1 =f'{save_dir}/s1.wav'
-    sf.write(save_path1, s1_sentences, 24000) # save each audio file
-    s1, _ = librosa.load(save_path1, sr=16000)
-    return s1, save_path1
-    
-   
-
-def process_tts_multi(text, save_dir, voice1, voice2):
-    pattern = r'\(s(\d+)\)\s*(.*?)(?=\s*\(s\d+\)|$)'
-    matches = re.findall(pattern, text, re.DOTALL)
-    
-    s1_sentences = []
-    s2_sentences = []
-
-    pipeline = KPipeline(lang_code='a', repo_id='weights/Kokoro-82M')
-    for idx, (speaker, content) in enumerate(matches):
-        if speaker == '1':
-            voice_tensor = torch.load(voice1, weights_only=True)
-            generator = pipeline(
-                content, voice=voice_tensor, # <= change voice here
-                speed=1, split_pattern=r'\n+'
-            )
-            audios = []
-            for i, (gs, ps, audio) in enumerate(generator):
-                audios.append(audio)
-            audios = torch.concat(audios, dim=0)
-            s1_sentences.append(audios)
-            s2_sentences.append(torch.zeros_like(audios))
-        elif speaker == '2':
-            voice_tensor = torch.load(voice2, weights_only=True)
-            generator = pipeline(
-                content, voice=voice_tensor, # <= change voice here
-                speed=1, split_pattern=r'\n+'
-            )
-            audios = []
-            for i, (gs, ps, audio) in enumerate(generator):
-                audios.append(audio)
-            audios = torch.concat(audios, dim=0)
-            s2_sentences.append(audios)
-            s1_sentences.append(torch.zeros_like(audios))
-    
-    s1_sentences = torch.concat(s1_sentences, dim=0)
-    s2_sentences = torch.concat(s2_sentences, dim=0)
-    sum_sentences = s1_sentences + s2_sentences
-    save_path1 =f'{save_dir}/s1.wav'
-    save_path2 =f'{save_dir}/s2.wav'
-    save_path_sum = f'{save_dir}/sum.wav'
-    sf.write(save_path1, s1_sentences, 24000) # save each audio file
-    sf.write(save_path2, s2_sentences, 24000)
-    sf.write(save_path_sum, sum_sentences, 24000)
-
-    s1, _ = librosa.load(save_path1, sr=16000)
-    s2, _ = librosa.load(save_path2, sr=16000)
-    # sum, _ = librosa.load(save_path_sum, sr=16000)
-    return s1, s2, save_path_sum
-
 def run_graio_demo(args):
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
@@ -517,7 +443,7 @@ def run_graio_demo(args):
 
     
     def generate_video(img2vid_image, vid2vid_vid, task_mode, img2vid_prompt, n_prompt, img2vid_audio_1, img2vid_audio_2,
-                    sd_steps, seed, text_guide_scale, audio_guide_scale, mode_selector, tts_text, resolution_select, human1_voice, human2_voice):
+                    sd_steps, seed, text_guide_scale, audio_guide_scale, mode_selector, resolution_select):
         input_data = {}
         input_data["prompt"] = img2vid_prompt
         if task_mode=='VideoDubbing':
@@ -527,11 +453,6 @@ def run_graio_demo(args):
         person = {}
         if mode_selector == "Single Person(Local File)":
             person['person1'] = img2vid_audio_1
-        elif mode_selector == "Single Person(TTS)":
-            tts_audio = {}
-            tts_audio['text'] = tts_text
-            tts_audio['human1_voice'] = human1_voice
-            input_data["tts_audio"] = tts_audio
         elif mode_selector == "Multi Person(Local File, audio add)":
             person['person1'] = img2vid_audio_1
             person['person2'] = img2vid_audio_2
@@ -541,11 +462,7 @@ def run_graio_demo(args):
             person['person2'] = img2vid_audio_2
             input_data["audio_type"] = 'para'
         else:
-            tts_audio = {}
-            tts_audio['text'] = tts_text
-            tts_audio['human1_voice'] = human1_voice
-            tts_audio['human2_voice'] = human2_voice
-            input_data["tts_audio"] = tts_audio
+            raise ValueError(f"Unsupported audio mode: {mode_selector}")
             
         input_data["cond_audio"] = person
 
@@ -572,26 +489,6 @@ def run_graio_demo(args):
                 torch.save(audio_embedding, emb_path)
                 input_data['cond_audio']['person1'] = emb_path
                 input_data['video_audio'] = sum_audio
-        elif 'TTS' in mode_selector:
-            if 'human2_voice' not in input_data['tts_audio'].keys():
-                new_human_speech1, sum_audio = process_tts_single(input_data['tts_audio']['text'], args.audio_save_dir, input_data['tts_audio']['human1_voice'])
-                audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
-                emb1_path = os.path.join(args.audio_save_dir, '1.pt')
-                torch.save(audio_embedding_1, emb1_path)
-                input_data['cond_audio']['person1'] = emb1_path
-                input_data['video_audio'] = sum_audio
-            else:
-                new_human_speech1, new_human_speech2, sum_audio = process_tts_multi(input_data['tts_audio']['text'], args.audio_save_dir, input_data['tts_audio']['human1_voice'], input_data['tts_audio']['human2_voice'])
-                audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
-                audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
-                emb1_path = os.path.join(args.audio_save_dir, '1.pt')
-                emb2_path = os.path.join(args.audio_save_dir, '2.pt')
-                torch.save(audio_embedding_1, emb1_path)
-                torch.save(audio_embedding_2, emb2_path)
-                input_data['cond_audio']['person1'] = emb1_path
-                input_data['cond_audio']['person2'] = emb2_path
-                input_data['video_audio'] = sum_audio
-
 
         # if len(input_data['cond_audio'])==2:
         #     new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
@@ -648,23 +545,15 @@ def run_graio_demo(args):
         return args.save_file + '.mp4'
 
     def toggle_audio_mode(mode):
-        if 'TTS' in mode:
-            return [
-                gr.Audio(visible=False, interactive=False),
-                gr.Audio(visible=False, interactive=False),
-                gr.Textbox(visible=True, interactive=True)
-            ]
-        elif 'Single' in mode:
+        if 'Single' in mode:
             return [
                 gr.Audio(visible=True, interactive=True),
-                gr.Audio(visible=False, interactive=False),
-                gr.Textbox(visible=False, interactive=False)
+                gr.Audio(visible=False, interactive=False)
             ]
         else:
             return [
                 gr.Audio(visible=True, interactive=True),
-                gr.Audio(visible=True, interactive=True),
-                gr.Textbox(visible=False, interactive=False)
+                gr.Audio(visible=True, interactive=True)
             ]
     
     def show_upload(mode):
@@ -721,7 +610,7 @@ def run_graio_demo(args):
                 
                 with gr.Accordion("Audio Options", open=True):
                     mode_selector = gr.Radio(
-                        choices=["Single Person(Local File)", "Single Person(TTS)", "Multi Person(Local File, audio add)", "Multi Person(Local File, audio parallel)", "Multi Person(TTS)"],
+                        choices=["Single Person(Local File)", "Multi Person(Local File, audio add)", "Multi Person(Local File, audio parallel)"],
                         label="Select person and audio mode.",
                         value="Single Person(Local File)"
                     )
@@ -732,16 +621,10 @@ def run_graio_demo(args):
                     )
                     img2vid_audio_1 = gr.Audio(label="Conditioning Audio for speaker 1", type="filepath", visible=True)
                     img2vid_audio_2 = gr.Audio(label="Conditioning Audio for speaker 2", type="filepath", visible=False)
-                    tts_text = gr.Textbox(
-                        label="Text for TTS",
-                        placeholder="Refer to the format in the examples",
-                        visible=False,
-                        interactive=False
-                    )
                     mode_selector.change(
                         fn=toggle_audio_mode,
                         inputs=mode_selector,
-                        outputs=[img2vid_audio_1, img2vid_audio_2, tts_text]
+                        outputs=[img2vid_audio_1, img2vid_audio_2]
                     )
 
                 with gr.Accordion("Advanced Options", open=False):
@@ -771,16 +654,6 @@ def run_graio_demo(args):
                             maximum=20,
                             value=2.0,
                             step=1)
-                    with gr.Row():
-                        human1_voice = gr.Textbox(
-                            label="Voice for the left person",
-                            value="weights/Kokoro-82M/voices/am_adam.pt",
-                        )
-                        human2_voice = gr.Textbox(
-                            label="Voice for right person",
-                            value="weights/Kokoro-82M/voices/af_heart.pt"
-                        )
-                    # with gr.Row():
                     n_prompt = gr.Textbox(
                         label="Negative Prompt",
                         placeholder="Describe the negative prompt you want to add",
@@ -795,17 +668,17 @@ def run_graio_demo(args):
                 
                 gr.Examples(
                     examples = [
-                        ['SingleImageDriven', 'examples/single/ref_image.png', None, "A woman is passionately singing into a professional microphone in a recording studio. She wears large black headphones and a dark cardigan over a gray top. Her long, wavy brown hair frames her face as she looks slightly upwards, her mouth open mid-song. The studio is equipped with various audio equipment, including a mixing console and a keyboard, with soundproofing panels on the walls. The lighting is warm and focused on her, creating a professional and intimate atmosphere. A close-up shot captures her expressive performance.", "Single Person(Local File)", "examples/single/1.wav", None, None],
-                        ['VideoDubbing', None, 'examples/single/ref_video.mp4', "A man is talking", "Single Person(Local File)", "examples/single/1.wav", None, None],
+                        ['SingleImageDriven', 'examples/single/ref_image.png', None, "A woman is passionately singing into a professional microphone in a recording studio. She wears large black headphones and a dark cardigan over a gray top. Her long, wavy brown hair frames her face as she looks slightly upwards, her mouth open mid-song. The studio is equipped with various audio equipment, including a mixing console and a keyboard, with soundproofing panels on the walls. The lighting is warm and focused on an intimate performance.", "Single Person(Local File)", "examples/single/1.wav", None],
+                        ['VideoDubbing', None, 'examples/single/ref_video.mp4', "A man is talking", "Single Person(Local File)", "examples/single/1.wav", None],
 
                     ],
-                    inputs = [task_mode, img2vid_image, vid2vid_vid, img2vid_prompt, mode_selector, img2vid_audio_1, img2vid_audio_2, tts_text],
+                    inputs = [task_mode, img2vid_image, vid2vid_vid, img2vid_prompt, mode_selector, img2vid_audio_1, img2vid_audio_2],
                 )
 
 
         run_i2v_button.click(
             fn=generate_video,
-            inputs=[img2vid_image, vid2vid_vid, task_mode, img2vid_prompt, n_prompt, img2vid_audio_1, img2vid_audio_2,sd_steps, seed, text_guide_scale, audio_guide_scale, mode_selector, tts_text, resolution_select, human1_voice, human2_voice],
+            inputs=[img2vid_image, vid2vid_vid, task_mode, img2vid_prompt, n_prompt, img2vid_audio_1, img2vid_audio_2,sd_steps, seed, text_guide_scale, audio_guide_scale, mode_selector, resolution_select],
             outputs=[result_gallery],
         )
     demo.launch(server_name="0.0.0.0", debug=True, server_port=8418)
